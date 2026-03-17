@@ -1,227 +1,249 @@
+import logging
 import os
-import warnings
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Dict, List
+from datetime import datetime, timezone
+from typing import Optional
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from urllib3.exceptions import InsecureRequestWarning
 
-from exchangelib import Account, Configuration, Credentials, DELEGATE
-from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+from attachments_store import AttachmentStore
+from exchange_client import ExchangeClientError, create_exchange_client
 
 
 load_dotenv()
 
-
-class ExchangeClientError(Exception):
-    """Raised when the Exchange backend cannot fulfil a request."""
+LOGGER = logging.getLogger(__name__)
 
 
-def _serialize_message_summary(item) -> Dict[str, object]:
-    sender = getattr(item, "sender", None) or getattr(item, "author", None)
-    sender_str = str(sender) if sender else ""
-    text_body = getattr(item, "text_body", None)
-    body_preview = None
-    if text_body:
-        body_preview = text_body[:500]
-    elif getattr(item, "body", None):
-        body_preview = str(item.body)[:500]
-
-    datetime_received = getattr(item, "datetime_received", None)
-    if datetime_received:
-        datetime_received = datetime_received.isoformat()
-
-    return {
-        "id": item.id,
-        "subject": getattr(item, "subject", ""),
-        "from": sender_str,
-        "datetime_received": datetime_received,
-        "is_read": bool(getattr(item, "is_read", False)),
-        "body_preview": body_preview,
-    }
+def _configure_logging() -> None:
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 
-def _serialize_message_full(item) -> Dict[str, object]:
-    data = _serialize_message_summary(item)
-    body = getattr(item, "text_body", None) or getattr(item, "body", None) or ""
-    data["body"] = str(body)
-    return data
+def _parse_int_arg(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = request.args.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
-class LiveExchangeClient:
-    def __init__(self) -> None:
-        BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
-        warnings.simplefilter("ignore", InsecureRequestWarning)
+def _parse_bool_arg(name: str, default: bool) -> bool:
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    raise ValueError(f"{name} must be 0 or 1")
 
-        username = os.getenv("EXCHANGE_USER")
-        password = os.getenv("EXCHANGE_PASSWORD")
-        service_endpoint = os.getenv("EXCHANGE_URL")
-        mailbox = os.getenv("MAILBOX")
 
-        missing = [
-            name
-            for name, value in (
-                ("EXCHANGE_USER", username),
-                ("EXCHANGE_PASSWORD", password),
-                ("EXCHANGE_URL", service_endpoint),
-                ("MAILBOX", mailbox),
-            )
-            if not value
-        ]
-        if missing:
-            raise RuntimeError(
-                "Missing required Exchange configuration: " + ", ".join(missing)
-            )
+def _resolve_storage_paths() -> tuple[str, str]:
+    root_env = os.getenv("ATTACHMENTS_ROOT")
+    db_env = os.getenv("ATTACHMENTS_DB_PATH")
+    if root_env and db_env:
+        return root_env, db_env
 
-        creds = Credentials(username=username, password=password)
-        config = Configuration(
-            service_endpoint=service_endpoint,
-            credentials=creds,
-            auth_type="NTLM",
-        )
-        self._account = Account(
-            primary_smtp_address=mailbox,
-            config=config,
-            autodiscover=False,
-            access_type=DELEGATE,
-        )
+    default_root = "/data/attachments"
+    default_db = "/data/state/attachments.sqlite3"
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return root_env or default_root, db_env or default_db
 
-    def list_messages(self, limit: int, only_unread: bool) -> List[Dict[str, object]]:
+    return (
+        root_env or "/tmp/wefa-exchange/attachments",
+        db_env or "/tmp/wefa-exchange/state/attachments.sqlite3",
+    )
+
+
+def create_app(exchange_client=None, attachment_store: Optional[AttachmentStore] = None) -> Flask:
+    _configure_logging()
+
+    exchange = exchange_client or create_exchange_client()
+    mailbox = os.getenv("MAILBOX", "mailbox@example.com")
+    attachments_root, attachments_db_path = _resolve_storage_paths()
+    attachments_max_bytes = int(os.getenv("ATTACHMENTS_MAX_BYTES", "26214400"))
+    include_inline_default = os.getenv("ATTACHMENTS_INCLUDE_INLINE", "1") == "1"
+
+    store = attachment_store or AttachmentStore(
+        attachments_root=attachments_root,
+        db_path=attachments_db_path,
+        mailbox=mailbox,
+        max_bytes=attachments_max_bytes,
+    )
+
+    app = Flask(__name__)
+    app.config["EXCHANGE_CLIENT"] = exchange
+    app.config["ATTACHMENT_STORE"] = store
+    app.config["ATTACHMENTS_INCLUDE_INLINE_DEFAULT"] = include_inline_default
+
+    @app.get("/inbox")
+    def inbox() -> tuple:
         try:
-            query = self._account.inbox.all().order_by("-datetime_received")
-            if only_unread:
-                query = query.filter(is_read=False)
-            messages = query[:limit]
-            return [_serialize_message_summary(message) for message in messages]
-        except Exception as exc:  # exchangelib raises many custom exceptions
-            raise ExchangeClientError("Unable to fetch messages from Exchange") from exc
+            limit = _parse_int_arg(name="limit", default=5, minimum=1, maximum=1000)
+            only_unread = _parse_bool_arg(name="only_unread", default=False)
+            items = app.config["EXCHANGE_CLIENT"].list_messages(
+                limit=limit, only_unread=only_unread
+            )
+            return jsonify(items), 200
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except ExchangeClientError:
+            LOGGER.exception("Failed to list inbox messages")
+            return jsonify({"error": "Unable to fetch inbox"}), 500
+        except Exception:
+            LOGGER.exception("Unhandled error while listing inbox")
+            return jsonify({"error": "Internal server error"}), 500
 
-    def get_message(self, message_id: str) -> Dict[str, object]:
+    @app.get("/message")
+    def get_message() -> tuple:
+        message_id = request.args.get("id")
+        if not message_id:
+            return jsonify({"error": "id parameter required"}), 400
+
         try:
-            item = self._account.inbox.get(id=message_id)
-        except Exception as exc:  # exchangelib raises many custom exceptions
-            raise ExchangeClientError("Unable to fetch message from Exchange") from exc
-        return _serialize_message_full(item)
+            item = app.config["EXCHANGE_CLIENT"].get_message(message_id)
+            item["attachments"] = app.config["ATTACHMENT_STORE"].get_attachments_for_message(
+                message_id
+            )
+            return jsonify(item), 200
+        except ExchangeClientError:
+            LOGGER.exception("Failed to fetch message", extra={"message_id": message_id})
+            return jsonify({"error": "Unable to fetch message"}), 500
+        except Exception:
+            LOGGER.exception("Unhandled error while fetching message", extra={"message_id": message_id})
+            return jsonify({"error": "Internal server error"}), 500
 
+    @app.post("/attachments/sync")
+    def sync_attachments() -> tuple:
+        try:
+            limit = _parse_int_arg(name="limit", default=100, minimum=1, maximum=1000)
+            only_unread = _parse_bool_arg(name="only_unread", default=True)
+            include_inline = _parse_bool_arg(
+                name="include_inline",
+                default=app.config["ATTACHMENTS_INCLUDE_INLINE_DEFAULT"],
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
-@dataclass
-class MockMessage:
-    id: str
-    subject: str
-    sender: str
-    datetime_received: str
-    is_read: bool
-    body: str
+        try:
+            messages = app.config["EXCHANGE_CLIENT"].list_messages_for_sync(
+                limit=limit,
+                only_unread=only_unread,
+                include_inline=include_inline,
+            )
+        except ExchangeClientError:
+            LOGGER.exception("Attachment sync failed while reading Exchange")
+            return jsonify({"error": "Unable to sync attachments"}), 500
+        except Exception:
+            LOGGER.exception("Unhandled attachment sync read error")
+            return jsonify({"error": "Internal server error"}), 500
 
-    @property
-    def body_preview(self) -> str:
-        return self.body[:500]
+        summary = {
+            "messages_scanned": 0,
+            "messages_with_attachments": 0,
+            "attachments_saved": 0,
+            "attachments_skipped": 0,
+            "errors": 0,
+        }
 
+        for message in messages:
+            summary["messages_scanned"] += 1
+            if message.attachments:
+                summary["messages_with_attachments"] += 1
 
-class MockExchangeClient:
-    def __init__(self) -> None:
-        now = datetime.utcnow()
-        self._messages: List[MockMessage] = [
-            MockMessage(
-                id="MOCK-1",
-                subject="Mock trade confirmation",
-                sender="tradebot@example.com",
-                datetime_received=(now - timedelta(hours=1)).isoformat(),
-                is_read=False,
-                body="Order #12345 has been executed successfully.",
-            ),
-            MockMessage(
-                id="MOCK-2",
-                subject="Mock daily summary",
-                sender="reports@example.com",
-                datetime_received=(now - timedelta(hours=5)).isoformat(),
-                is_read=True,
-                body="Daily summary for your mock account.",
-            ),
-            MockMessage(
-                id="MOCK-3",
-                subject="Mock onboarding",
-                sender="support@example.com",
-                datetime_received=(now - timedelta(days=1)).isoformat(),
-                is_read=False,
-                body="Welcome to the mock Exchange environment!",
-            ),
-        ]
+            try:
+                app.config["ATTACHMENT_STORE"].upsert_message(message)
+            except Exception:
+                summary["errors"] += 1
+                LOGGER.exception("Failed to upsert message metadata", extra={"message_id": message.id})
+                continue
 
-    def list_messages(self, limit: int, only_unread: bool) -> List[Dict[str, object]]:
-        messages = self._messages
-        if only_unread:
-            messages = [message for message in messages if not message.is_read]
-        messages = messages[:limit]
-        return [
-            {
-                "id": message.id,
-                "subject": message.subject,
-                "from": message.sender,
-                "datetime_received": message.datetime_received,
-                "is_read": message.is_read,
-                "body_preview": message.body_preview,
-            }
-            for message in messages
-        ]
+            for attachment in message.attachments:
+                try:
+                    result = app.config["ATTACHMENT_STORE"].save_attachment(message, attachment)
+                except Exception:
+                    summary["errors"] += 1
+                    LOGGER.exception(
+                        "Failed to save attachment",
+                        extra={"message_id": message.id, "name": attachment.name},
+                    )
+                    continue
 
-    def get_message(self, message_id: str) -> Dict[str, object]:
-        for message in self._messages:
-            if message.id == message_id:
-                return {
-                    "id": message.id,
-                    "subject": message.subject,
-                    "from": message.sender,
-                    "datetime_received": message.datetime_received,
-                    "is_read": message.is_read,
-                    "body": message.body,
-                }
-        raise ExchangeClientError(f"Message {message_id} not found in mock inbox")
+                if result.saved:
+                    summary["attachments_saved"] += 1
+                    LOGGER.info(
+                        "Attachment persisted",
+                        extra={
+                            "message_id": message.id,
+                            "name": attachment.name,
+                            "size_bytes": attachment.size_bytes,
+                            "sha256": result.sha256,
+                            "stored_path": result.stored_path,
+                        },
+                    )
+                else:
+                    summary["attachments_skipped"] += 1
+                    LOGGER.info(
+                        "Attachment skipped",
+                        extra={
+                            "message_id": message.id,
+                            "name": attachment.name,
+                            "reason": result.skipped_reason,
+                            "sha256": result.sha256,
+                        },
+                    )
+
+        try:
+            app.config["ATTACHMENT_STORE"].set_sync_state(
+                "last_sync_at", datetime.now(timezone.utc).isoformat()
+            )
+        except Exception:
+            summary["errors"] += 1
+            LOGGER.exception("Failed to persist sync checkpoint")
+
+        LOGGER.info("Attachment sync summary: %s", summary)
+        return jsonify(summary), 200
+
+    @app.get("/attachments")
+    def list_attachments() -> tuple:
+        message_id = request.args.get("message_id")
+        try:
+            limit = _parse_int_arg(name="limit", default=100, minimum=1, maximum=1000)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            rows = app.config["ATTACHMENT_STORE"].list_attachments(
+                message_id=message_id,
+                limit=limit,
+            )
+            return jsonify(rows), 200
+        except Exception:
+            LOGGER.exception("Failed to list attachments", extra={"message_id": message_id})
+            return jsonify({"error": "Unable to list attachments"}), 500
+
+    return app
 
 
 PORT = int(os.getenv("PORT", "8765"))
-backend = os.getenv("EXCHANGE_BACKEND", "mock").lower()
-
-if backend == "live":
-    exchange_client = LiveExchangeClient()
-elif backend == "mock":
-    exchange_client = MockExchangeClient()
-else:
-    raise RuntimeError(
-        "EXCHANGE_BACKEND must be either 'live' or 'mock'"
-    )
-
-app = Flask(__name__)
-
-
-@app.get("/inbox")
-def inbox() -> tuple:
-    limit = int(request.args.get("limit", "5"))
-    only_unread = request.args.get("only_unread", "0") == "1"
-
+app = None
+if os.getenv("WEFA_INIT_ON_IMPORT", "1") == "1":
     try:
-        items = exchange_client.list_messages(limit=limit, only_unread=only_unread)
-    except ExchangeClientError as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    return jsonify(items)
-
-
-@app.get("/message")
-def get_message() -> tuple:
-    message_id = request.args.get("id")
-    if not message_id:
-        return jsonify({"error": "id parameter required"}), 400
-
-    try:
-        item = exchange_client.get_message(message_id)
-    except ExchangeClientError as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    return jsonify(item)
+        app = create_app()
+    except Exception:
+        LOGGER.exception("Automatic app initialization failed; use create_app() explicitly.")
+        app = None
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    runtime_app = create_app()
+    runtime_app.run(host="0.0.0.0", port=PORT, debug=False)

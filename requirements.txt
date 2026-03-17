@@ -2,3 +2,4 @@ Flask
 exchangelib
 urllib3
 python-dotenv
+pytest

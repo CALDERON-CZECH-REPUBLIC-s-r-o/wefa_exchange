@@ -1,0 +1,62 @@
+Dobrý den, pane Čejka
+
+nejprve jsem se podíval na odesílání e-mailů – zdá se, že funguje. Zkoušel jsem to a e-mail mi dorazil. Použil jsem následující nastavení:
+
+server = WEFA-EX19.wefasingen.local
+port = 587
+username = obchodcz@wefasingen.local
+password = T7bGCYYc91QPDC44
+to = mapik@mapik.cz
+
+
+Co se týče příjmu e-mailů, je to o něco složitější. Ve skutečnosti jsme to nikdy přímo na naši aplikaci nedělali. Klasický IMAP u vás pravděpodobně nebude fungovat – může to být kvůli nastavení nebo povolení. Zkusím se zeptat. My používáme interně pouze Exchange a Outlook, takže jiné metody stahování e-mailů jsme nepotřebovali.
+
+Napsal jsem krátký Python kód pro kontrolu schránky, který funguje:
+
+
+=================================
+
+from exchangelib import Credentials, Account, Configuration, DELEGATE
+from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+
+warnings.simplefilter('ignore', InsecureRequestWarning) # vypni hlasky
+
+# Ignorovat SSL certifikát
+BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter # nekontroluj certifikaty
+
+#autentizace
+creds = Credentials(username='WEFASINGEN\\obchodcz', password='T7bGCYYc91QPDC44') # tady je to dve lomitka a domena z nemecka WEFASINGEN 
+
+# jinak ip je 10.0.0.220 - tak by na to mel byt ping
+config = Configuration(
+    service_endpoint='https://owa.wefa.com/EWS/Exchange.asmx', # Připojení pres login https://owa.wefa.com/ - tam máte jmeno a heslo
+    credentials=creds,
+    auth_type='NTLM' # musi NTLM 
+)
+
+
+account = Account(
+    primary_smtp_address='obchodcz@wefa.com', # Připojení k mailboxu to je email 
+    config=config,
+    autodiscover=False,
+    access_type=DELEGATE
+)
+
+# Stažení posledních 5 e-mailů - je tam ted 1 co jsem tam poslal
+for item in account.inbox.all().order_by('-datetime_received')[:5]:
+    print(item.datetime_received, item.subject)
+
+
+============================
+
+Co se týče přihlášení na Exchange, loginy jsou trochu specifické – běžně se přihlašuji přes web:  https://owa.wefa.com/
+WEFASINGEN\obchodcz
+.... heslo ...
+
+
+Momentálně nemohu ověřit, zda to bude fungovat z vašeho počítače přes VPN nebo internet – přihlášení zvenku není povoleno, proto testujte pouze z místní sítě. Předpokládal jsem, že budete testovat přímo na stroji u nás, kde by spojení mělo fungovat.
+
+Dám vědět, jakmile zjistím více ohledně IMAPu. Klidně se ale ozvěte, pokud budete potřebovat další informace.
+
